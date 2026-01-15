@@ -13,6 +13,48 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
 use uuid::Uuid;
 
+/// Rate limiter for connections
+#[derive(Clone)]
+pub struct RateLimiter {
+    message_count: Arc<AtomicUsize>,
+    window_start: Arc<tokio::sync::RwLock<Instant>>,
+    max_messages: usize,
+    window_duration: Duration,
+}
+
+impl RateLimiter {
+    pub fn new(max_messages: usize, window_duration: Duration) -> Self {
+        Self {
+            message_count: Arc::new(AtomicUsize::new(0)),
+            window_start: Arc::new(tokio::sync::RwLock::new(Instant::now())),
+            max_messages,
+            window_duration,
+        }
+    }
+
+    /// Check if a message is allowed under the rate limit
+    pub async fn check(&self) -> bool {
+        let mut start = self.window_start.write().await;
+        let now = Instant::now();
+
+        // Reset window if expired
+        if now.duration_since(*start) >= self.window_duration {
+            *start = now;
+            self.message_count.store(0, Ordering::Relaxed);
+        }
+
+        // Check and increment
+        let count = self.message_count.fetch_add(1, Ordering::Relaxed);
+        count < self.max_messages
+    }
+
+    /// Reset the rate limiter
+    pub async fn reset(&self) {
+        self.message_count.store(0, Ordering::Relaxed);
+        *self.window_start.write().await = Instant::now();
+    }
+}
+
 /// WebSocket connection state
 #[derive(Debug)]
 pub struct ConnectionState {
@@ -114,12 +156,13 @@ pub struct WebSocketManager {
     /// Connection sender channels
     senders: Arc<DashMap<ConnectionId, mpsc::UnboundedSender<Message>>>,
     /// Room manager
-    #[allow(dead_code)]
-    room_manager: RoomManager,
+    pub room_manager: RoomManager,
     /// Active connection count
     connection_count: AtomicUsize,
     /// Message handlers
     message_handlers: Arc<DashMap<MessageType, Box<dyn MessageHandler + Send + Sync>>>,
+    /// Rate limiter per connection
+    rate_limiters: Arc<DashMap<ConnectionId, Arc<RateLimiter>>>,
 }
 
 /// Wrapper for Arc<dyn MessageHandler>
@@ -157,6 +200,45 @@ pub trait MessageHandler: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error>>;
 }
 
+/// Context for handling WebSocket messages
+struct MessageHandlerContext {
+    connection_id: ConnectionId,
+    connection_state: Arc<RwLock<ConnectionState>>,
+    connections: Arc<DashMap<ConnectionId, Arc<RwLock<ConnectionState>>>>,
+    senders: Arc<DashMap<ConnectionId, mpsc::UnboundedSender<Message>>>,
+    handlers: Arc<DashMap<MessageType, Box<dyn MessageHandler + Send + Sync>>>,
+    config: WebSocketConfig,
+    connection_count: Arc<AtomicUsize>,
+    room_manager: RoomManager,
+    rate_limiters: Arc<DashMap<ConnectionId, Arc<RateLimiter>>>,
+}
+
+impl MessageHandlerContext {
+    fn new(
+        connection_id: ConnectionId,
+        connection_state: Arc<RwLock<ConnectionState>>,
+        connections: Arc<DashMap<ConnectionId, Arc<RwLock<ConnectionState>>>>,
+        senders: Arc<DashMap<ConnectionId, mpsc::UnboundedSender<Message>>>,
+        handlers: Arc<DashMap<MessageType, Box<dyn MessageHandler + Send + Sync>>>,
+        config: WebSocketConfig,
+        connection_count: Arc<AtomicUsize>,
+        room_manager: RoomManager,
+        rate_limiters: Arc<DashMap<ConnectionId, Arc<RateLimiter>>>,
+    ) -> Self {
+        Self {
+            connection_id,
+            connection_state,
+            connections,
+            senders,
+            handlers,
+            config,
+            connection_count,
+            room_manager,
+            rate_limiters,
+        }
+    }
+}
+
 impl WebSocketManager {
     /// Create a new WebSocket manager
     pub fn new(config: WebSocketConfig) -> Self {
@@ -167,7 +249,15 @@ impl WebSocketManager {
             room_manager: RoomManager::new(),
             connection_count: AtomicUsize::new(0),
             message_handlers: Arc::new(DashMap::new()),
+            rate_limiters: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Get rate limit config
+    fn get_rate_limit_config(&self) -> Option<(usize, Duration)> {
+        self.config.rate_limit.as_ref().map(|rl| {
+            (rl.messages_per_minute as usize, Duration::from_secs(60))
+        })
     }
 
     /// Handle new WebSocket connection
@@ -194,6 +284,13 @@ impl WebSocketManager {
         // Store connection info
         self.connections.insert(connection_id, connection_state.clone());
         self.senders.insert(connection_id, message_sender);
+
+        // Initialize rate limiter if configured
+        if let Some((max_msgs, window)) = self.get_rate_limit_config() {
+            let rate_limiter = Arc::new(RateLimiter::new(max_msgs, window));
+            self.rate_limiters.insert(connection_id, rate_limiter);
+        }
+
         self.connection_count.fetch_add(1, Ordering::Relaxed);
 
         tracing::info!("New WebSocket connection: {} from {}", connection_id, addr);
@@ -204,24 +301,24 @@ impl WebSocketManager {
         self.send_message_to_connection(connection_id, welcome_msg).await?;
 
         // Handle incoming messages
-        let connections_clone = self.connections.clone();
-        let senders_clone = self.senders.clone();
-        let handlers_clone = self.message_handlers.clone();
-        let config_clone = self.config.clone();
-        let connection_count_clone = Arc::new(AtomicUsize::new(self.connection_count.load(Ordering::Relaxed)));
+        let ctx = MessageHandlerContext::new(
+            connection_id,
+            connection_state.clone(),
+            self.connections.clone(),
+            self.senders.clone(),
+            self.message_handlers.clone(),
+            self.config.clone(),
+            Arc::new(AtomicUsize::new(self.connection_count.load(Ordering::Relaxed))),
+            self.room_manager.clone(),
+            self.rate_limiters.clone(),
+        );
 
         tokio::spawn(async move {
             if let Err(e) = Self::handle_messages(
-                connection_id,
+                ctx,
                 &mut ws_receiver,
                 &mut message_receiver,
                 ws_sender,
-                connection_state.clone(),
-                connections_clone,
-                senders_clone,
-                handlers_clone,
-                config_clone,
-                connection_count_clone,
             ).await {
                 tracing::error!("Error handling WebSocket messages for {}: {:?}", connection_id, e);
             }
@@ -232,17 +329,16 @@ impl WebSocketManager {
 
     /// Handle incoming WebSocket messages
     async fn handle_messages(
-        connection_id: ConnectionId,
+        ctx: MessageHandlerContext,
         ws_receiver: &mut SplitStream<WebSocket>,
         message_receiver: &mut mpsc::UnboundedReceiver<Message>,
         mut ws_sender: SplitSink<WebSocket, Message>,
-        connection_state: Arc<RwLock<ConnectionState>>,
-        connections: Arc<DashMap<ConnectionId, Arc<RwLock<ConnectionState>>>>,
-        senders: Arc<DashMap<ConnectionId, mpsc::UnboundedSender<Message>>>,
-        handlers: Arc<DashMap<MessageType, Box<dyn MessageHandler + Send + Sync>>>,
-        config: WebSocketConfig,
-        connection_count: Arc<AtomicUsize>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let connection_id = ctx.connection_id;
+        let config = ctx.config.clone();
+        let senders = ctx.senders.clone();
+        let connections = ctx.connections.clone();
+
         // Start ping task
         let ping_connection_id = connection_id;
         let ping_config = config.clone();
@@ -261,10 +357,11 @@ impl WebSocketManager {
         });
 
         // Start cleanup task
-        let _cleanup_connection_id = connection_id;
         let cleanup_config = config.clone();
         let cleanup_connections = connections.clone();
         let cleanup_senders = senders.clone();
+        let cleanup_rate_limiters = ctx.rate_limiters.clone();
+        let cleanup_room_manager = ctx.room_manager.clone();
         tokio::spawn(async move {
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -275,7 +372,7 @@ impl WebSocketManager {
                     .iter()
                     .filter_map(|entry| {
                         let state = entry.value();
-                        if state.try_read().map_or(false, |s| s.is_stale(cleanup_config.idle_timeout_duration())) {
+                        if state.try_read().is_ok_and(|s| s.is_stale(cleanup_config.idle_timeout_duration())) {
                             Some(*entry.key())
                         } else {
                             None
@@ -285,7 +382,13 @@ impl WebSocketManager {
 
                 for conn_id in stale_connections {
                     tracing::info!("Closing stale connection: {}", conn_id);
-                    Self::close_connection(conn_id, cleanup_connections.clone(), cleanup_senders.clone()).await;
+                    Self::close_connection(
+                        conn_id,
+                        cleanup_connections.clone(),
+                        cleanup_senders.clone(),
+                        cleanup_rate_limiters.clone(),
+                        &cleanup_room_manager,
+                    ).await;
                 }
             }
         });
@@ -299,8 +402,10 @@ impl WebSocketManager {
                             if let Err(e) = Self::process_websocket_message(
                                 msg,
                                 connection_id,
-                                connection_state.clone(),
-                                &handlers,
+                                ctx.connection_state.clone(),
+                                &ctx.handlers,
+                                &ctx.config,
+                                &ctx.rate_limiters,
                             ).await {
                                 tracing::error!("Error processing WebSocket message: {:?}", e);
                                 break;
@@ -336,8 +441,14 @@ impl WebSocketManager {
         }
 
         // Cleanup connection
-        Self::close_connection(connection_id, connections, senders).await;
-        (*connection_count).fetch_sub(1, Ordering::Relaxed);
+        Self::close_connection(
+            connection_id,
+            connections,
+            senders,
+            ctx.rate_limiters.clone(),
+            &ctx.room_manager,
+        ).await;
+        ctx.connection_count.fetch_sub(1, Ordering::Relaxed);
         tracing::info!("WebSocket connection {} closed", connection_id);
 
         Ok(())
@@ -349,12 +460,28 @@ impl WebSocketManager {
         connection_id: ConnectionId,
         connection_state: Arc<RwLock<ConnectionState>>,
         handlers: &DashMap<MessageType, Box<dyn MessageHandler + Send + Sync>>,
+        config: &WebSocketConfig,
+        rate_limiters: &Arc<DashMap<ConnectionId, Arc<RateLimiter>>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut state = connection_state.write().await;
         state.stats.messages_received.fetch_add(1, Ordering::Relaxed);
 
+        // Check rate limit
+        if let Some(limiter) = rate_limiters.get(&connection_id) {
+            if !limiter.check().await {
+                tracing::warn!("Rate limit exceeded for connection {}", connection_id);
+                return Err("Rate limit exceeded".into());
+            }
+        }
+
         match message {
             Message::Text(text) => {
+                // Check message size
+                if text.len() > config.max_message_size {
+                    tracing::warn!("Message too large: {} bytes (max: {})", text.len(), config.max_message_size);
+                    return Err("Message too large".into());
+                }
+
                 // Parse JSON message
                 match serde_json::from_str::<WebSocketMessage>(&text) {
                     Ok(ws_msg) => {
@@ -376,6 +503,11 @@ impl WebSocketManager {
                 }
             }
             Message::Binary(data) => {
+                // Check binary message size
+                if data.len() > config.max_message_size {
+                    tracing::warn!("Binary message too large: {} bytes (max: {})", data.len(), config.max_message_size);
+                    return Err("Message too large".into());
+                }
                 state.stats.bytes_received.fetch_add(data.len(), Ordering::Relaxed);
                 tracing::debug!("Received binary message of {} bytes", data.len());
             }
@@ -430,12 +562,33 @@ impl WebSocketManager {
     /// Broadcast message to a specific room
     pub async fn broadcast_to_room(
         &self,
-        _room_id: &RoomId,
+        room_id: &RoomId,
         message: WebSocketMessage,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        // In a full implementation, we would iterate through connections in the room
-        // For now, just broadcast to all connections
-        self.broadcast_message(message).await
+        // Get all connections in the room
+        let room_connections = self.room_manager.get_room_connections(room_id).await;
+
+        if room_connections.is_empty() {
+            tracing::debug!("No connections in room {}", room_id);
+            return Ok(0);
+        }
+
+        // Serialize message once for efficiency
+        let json_message = serde_json::to_string(&message)?;
+        let ws_message = Message::Text(json_message.into());
+        let mut sent_count = 0;
+
+        // Send to all connections in the room
+        for connection_id in room_connections {
+            if let Some(sender) = self.senders.get(&connection_id) {
+                if sender.send(ws_message.clone()).is_ok() {
+                    sent_count += 1;
+                }
+            }
+        }
+
+        tracing::debug!("Broadcast to room {} sent to {} connections", room_id, sent_count);
+        Ok(sent_count)
     }
 
     /// Get connection state
@@ -472,9 +625,13 @@ impl WebSocketManager {
         connection_id: ConnectionId,
         connections: Arc<DashMap<ConnectionId, Arc<RwLock<ConnectionState>>>>,
         senders: Arc<DashMap<ConnectionId, mpsc::UnboundedSender<Message>>>,
+        rate_limiters: Arc<DashMap<ConnectionId, Arc<RateLimiter>>>,
+        room_manager: &RoomManager,
     ) {
         connections.remove(&connection_id);
         senders.remove(&connection_id);
+        rate_limiters.remove(&connection_id);
+        room_manager.leave_all_rooms(&connection_id).await;
     }
 
     /// Create a dummy manager for testing

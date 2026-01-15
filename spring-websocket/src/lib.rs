@@ -4,6 +4,7 @@
 //! This plugin provides WebSocket functionality for spring-rs applications,
 //! built on top of tokio-tungstenite and integrated with axum web framework.
 
+pub mod auth;
 pub mod config;
 pub mod handler;
 pub mod manager;
@@ -11,9 +12,11 @@ pub mod message;
 pub mod room;
 
 // Re-export key types and traits
+pub use auth::{AuthInfo, AuthService, AuthError, SessionStore, WsClaims};
 pub use handler::MessageHandlerBuilder;
-pub use manager::{MessageHandler, WebSocketManager};
+pub use manager::{MessageHandler, WebSocketManager, RateLimiter};
 pub use message::{WebSocketMessage, MessageType, ConnectionId, MessageId};
+pub use room::{Room, RoomManager, RoomId, RoomError};
 
 // pub use spring_macros::websocket; // TODO: Implement websocket macro
 

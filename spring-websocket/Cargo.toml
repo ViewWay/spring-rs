@@ -18,6 +18,7 @@ anyhow = "1.0"
 tracing = "0.1"
 schemars = "1.0.4"
 thiserror = "2.0.16"
+jsonwebtoken = "9"
 spring = { version = "0.4.0", path = "../spring" }
 spring-web = { version = "0.4.0", path = "../spring-web" }
 spring-macros = { version = "0.4.0", path = "../spring-macros" }

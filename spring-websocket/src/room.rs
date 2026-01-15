@@ -1,5 +1,5 @@
-use crate::message::{ConnectionId, WebSocketMessage};
-use dashmap::DashSet;
+use crate::message::ConnectionId;
+use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -7,72 +7,7 @@ use tokio::sync::RwLock;
 /// Unique identifier for rooms
 pub type RoomId = String;
 
-/// Room management system
-#[derive(Clone)]
-pub struct RoomManager {
-    /// All active rooms
-    rooms: Arc<RwLock<DashSet<RoomId>>>,
-}
-
-impl RoomManager {
-    /// Create a new room manager
-    pub fn new() -> Self {
-        Self {
-            rooms: Arc::new(RwLock::new(DashSet::new())),
-        }
-    }
-
-    /// Create a new room
-    pub async fn create_room(&self, room_id: RoomId) -> Result<(), RoomError> {
-        let rooms = self.rooms.write().await;
-        if rooms.contains(&room_id) {
-            return Err(RoomError::RoomAlreadyExists(room_id.clone()));
-        }
-
-        // Need mutable access to insert
-        drop(rooms);
-        let rooms = self.rooms.write().await;
-        rooms.insert(room_id.clone());
-        tracing::info!("Created room: {}", room_id);
-        Ok(())
-    }
-
-    /// Delete a room
-    pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), RoomError> {
-        let rooms = self.rooms.write().await;
-        if !rooms.remove(room_id).is_some() {
-            return Err(RoomError::RoomNotFound(room_id.clone()));
-        }
-        tracing::info!("Deleted room: {}", room_id);
-        Ok(())
-    }
-
-    /// Check if a room exists
-    pub async fn room_exists(&self, room_id: &RoomId) -> bool {
-        let rooms = self.rooms.read().await;
-        rooms.contains(room_id)
-    }
-
-    /// Get all active rooms
-    pub async fn list_rooms(&self) -> Vec<RoomId> {
-        let rooms = self.rooms.read().await;
-        rooms.iter().map(|r| r.clone()).collect()
-    }
-
-    /// Get room count
-    pub async fn room_count(&self) -> usize {
-        let rooms = self.rooms.read().await;
-        rooms.len()
-    }
-}
-
-impl Default for RoomManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Individual room state
+/// Room with its connections
 #[derive(Clone)]
 pub struct Room {
     /// Room ID
@@ -129,24 +64,6 @@ impl Room {
         self.connections.read().await.contains(connection_id)
     }
 
-    /// Broadcast a message to all connections in the room
-    pub async fn broadcast(&self, message: WebSocketMessage) -> Result<usize, RoomError> {
-        let connections = self.connections.read().await;
-        let connection_count = connections.len();
-
-        // Here we would send the message to all connections
-        // This is a simplified version - in a real implementation,
-        // you would need access to the actual WebSocket senders
-        tracing::debug!(
-            "Broadcasting message {} to {} connections in room {}",
-            message.id,
-            connection_count,
-            self.id
-        );
-
-        Ok(connection_count)
-    }
-
     /// Set room metadata
     pub async fn set_metadata<K: Into<String>, V: Into<String>>(
         &self,
@@ -167,6 +84,115 @@ impl Room {
     /// Get all room metadata
     pub async fn get_all_metadata(&self) -> std::collections::HashMap<String, String> {
         self.metadata.read().await.clone()
+    }
+}
+
+/// Room management system - manages rooms and their connections
+#[derive(Clone)]
+pub struct RoomManager {
+    /// All active rooms with their state
+    rooms: Arc<DashMap<RoomId, Room>>,
+}
+
+impl RoomManager {
+    /// Create a new room manager
+    pub fn new() -> Self {
+        Self {
+            rooms: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Create a new room
+    pub async fn create_room(&self, room_id: RoomId) -> Result<(), RoomError> {
+        if self.rooms.contains_key(&room_id) {
+            return Err(RoomError::RoomAlreadyExists(room_id.clone()));
+        }
+
+        let room = Room::new(room_id.clone());
+        self.rooms.insert(room_id.clone(), room);
+        tracing::info!("Created room: {}", room_id);
+        Ok(())
+    }
+
+    /// Delete a room
+    pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), RoomError> {
+        if self.rooms.remove(room_id).is_none() {
+            return Err(RoomError::RoomNotFound(room_id.clone()));
+        }
+        tracing::info!("Deleted room: {}", room_id);
+        Ok(())
+    }
+
+    /// Check if a room exists
+    pub async fn room_exists(&self, room_id: &RoomId) -> bool {
+        self.rooms.contains_key(room_id)
+    }
+
+    /// Get all active rooms
+    pub async fn list_rooms(&self) -> Vec<RoomId> {
+        self.rooms.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Get room count
+    pub async fn room_count(&self) -> usize {
+        self.rooms.len()
+    }
+
+    /// Get a room by ID
+    pub fn get_room(&self, room_id: &RoomId) -> Option<Room> {
+        self.rooms.get(room_id).map(|entry| entry.clone())
+    }
+
+    /// Add a connection to a room (creates room if it doesn't exist)
+    pub async fn join_room(&self, room_id: RoomId, connection_id: ConnectionId) -> Result<(), RoomError> {
+        let room = self.rooms.entry(room_id.clone()).or_insert_with(|| Room::new(room_id.clone()));
+        room.join(connection_id).await
+    }
+
+    /// Remove a connection from a room
+    pub async fn leave_room(&self, room_id: &RoomId, connection_id: &ConnectionId) -> Result<(), RoomError> {
+        if let Some(room) = self.rooms.get(room_id) {
+            room.leave(connection_id).await?;
+            // Delete room if empty
+            if room.connection_count().await == 0 {
+                self.rooms.remove(room_id);
+            }
+            Ok(())
+        } else {
+            Err(RoomError::RoomNotFound(room_id.clone()))
+        }
+    }
+
+    /// Remove a connection from all rooms
+    pub async fn leave_all_rooms(&self, connection_id: &ConnectionId) {
+        let room_ids: Vec<RoomId> = self.rooms.iter().map(|entry| entry.key().clone()).collect();
+        for room_id in room_ids {
+            let _ = self.leave_room(&room_id, connection_id).await;
+        }
+    }
+
+    /// Get all connections in a room
+    pub async fn get_room_connections(&self, room_id: &RoomId) -> HashSet<ConnectionId> {
+        if let Some(room) = self.rooms.get(room_id) {
+            room.get_connections().await
+        } else {
+            HashSet::new()
+        }
+    }
+
+    /// Check if a room is empty
+    pub async fn is_room_empty(&self, room_id: &RoomId) -> bool {
+        if let Some(room) = self.rooms.get(room_id) {
+            room.connection_count().await == 0
+        } else {
+            true
+        }
+    }
+}
+
+impl Default for RoomManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -248,6 +274,23 @@ mod tests {
 
         // Delete room
         assert!(manager.delete_room(&room_id).await.is_ok());
+        assert!(!manager.room_exists(&room_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_room_manager_join_leave() {
+        let manager = RoomManager::new();
+        let room_id = "chat_room".to_string();
+        let connection_id = uuid::Uuid::new_v4();
+
+        // Join creates room automatically
+        assert!(manager.join_room(room_id.clone(), connection_id).await.is_ok());
+        assert!(manager.room_exists(&room_id).await);
+        assert_eq!(manager.get_room_connections(&room_id).await.len(), 1);
+
+        // Leave room
+        assert!(manager.leave_room(&room_id, &connection_id).await.is_ok());
+        // Room should be deleted when empty
         assert!(!manager.room_exists(&room_id).await);
     }
 }
