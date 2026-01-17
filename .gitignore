@@ -33,6 +33,8 @@ rust-project.json
 *.iml
 
 docs/public
+### Git Worktrees ###
+.worktrees/
 
 ### flamegraph
 perf*
